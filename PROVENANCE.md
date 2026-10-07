@@ -9,3 +9,9 @@
   regenerated against Linux v7.2.6 so it applies with `fuzz=0`.
 - Everything else (scripts, configs, notes) was written while bringing this up on a
   Xiaomi Pad 8 Pro (SM8750P, "piano"), and is offered as-is with no warranty.
+
+## Licensing
+
+The kernel patches in `patches/` are Linux kernel code and are **GPL-2.0**, hence the
+repository licence. The VA-API backend is a separate project with its own licence -
+see radxa-pkg/libva-v4l2. The scripts and notes here may be reused freely.
