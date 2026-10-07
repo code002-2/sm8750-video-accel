@@ -16,6 +16,37 @@ kernel has the `qcom-iris` driver (`CONFIG_VIDEO_QCOM_IRIS`).
 | **VA-API** (Chrome, Firefox encode, Sunshine, GStreamer, ffmpeg) | **this repository** |
 | Hardware encode | H.264 and HEVC only - a silicon limit |
 
+## Does my device have Iris?
+
+Run `scripts/05-detect-codec.sh`. It reports the generation, the bound driver, the
+firmware it wants and the codecs it exposes, then says what to do:
+
+    [3] driver bound to the codec device
+        aa00000.video-codec-ml             driver=qcom-iris
+    [5] firmware (Iris needs vpu35, Venus needs venus-*)
+        /lib/firmware/qcom/sm8750/xiaomi/piano/vpu35_4v.mbn
+    [6] v4l2 devices and codecs
+        /dev/video0 decoder: decodes 'H264' 'HEVC' 'VP90' 'AV01' | outputs 'NV12' 'P010'
+        /dev/video1 encoder: encodes 'H264' 'HEVC' | accepts 'NV12' 'Q08C'
+
+Quick manual equivalents:
+
+    # which driver is bound (qcom-iris = Iris, qcom-venus = the older block)
+    for d in /sys/bus/platform/devices/*video-codec*; do
+        basename "$(readlink -f "$d/driver")"
+    done
+
+    # is the driver even built?
+    zcat /proc/config.gz | grep -E 'CONFIG_VIDEO_QCOM_(IRIS|VENUS)'
+
+    # what can the decoder take, and what can the encoder produce?
+    v4l2-ctl -d /dev/video0 --list-formats-out     # decoder: coded input
+    v4l2-ctl -d /dev/video1 --list-formats         # encoder: coded output
+
+If only `qcom-venus` shows up, this repository's VA-API work does not apply (the Radxa
+backend targets Iris); use `mpv --hwdec=v4l2m2m-copy` directly, which needs no backend
+at all.
+
 ## The two pieces
 
 1. **A VA-API backend for stateful V4L2 M2M** - use
