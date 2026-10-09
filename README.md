@@ -1,8 +1,14 @@
 # SM8750 / Qualcomm Iris video acceleration on mainline Linux
 
-Hardware **decode** (H.264, HEVC incl. Main10, VP9, AV1) and hardware **encode**
+Hardware **decode** (H.264, HEVC incl. Main10, VP9) and hardware **encode**
 (H.264, HEVC) for Qualcomm's Iris codec, exposed to normal applications through
 **VA-API**, plus the kernel-side patches that makes it actually work.
+
+**AV1** is a separate, unfinished story: the kernel driver supports it completely and
+this repository teaches the VA-API backend to advertise it, but decoding still fails at
+the final submit. See [docs/av1-decode.md](docs/av1-decode.md) for exactly how far it
+got and where it stops. AV1 *encoding* is not possible at all - the silicon has no AV1
+encoder.
 
 Developed on a **Xiaomi Pad 8 Pro (SM8750P, codename "piano")** running Debian 13 with
 a 7.2.6 kernel, but nothing here is tablet-specific: it applies to any device whose
@@ -13,6 +19,8 @@ kernel has the `qcom-iris` driver (`CONFIG_VIDEO_QCOM_IRIS`).
 | Path | Status |
 |---|---|
 | `v4l2m2m-copy` (mpv, Firefox) | works without any of this - the driver exposes V4L2 M2M directly |
+| AV1 decode | kernel-ready, VA-API advertises it, **decoding not yet working** - [docs/av1-decode.md](docs/av1-decode.md) |
+| AV1 encode | **not possible** - the silicon has no AV1 encoder |
 | **VA-API** (Chrome, Firefox encode, Sunshine, GStreamer, ffmpeg) | **this repository** |
 | Hardware encode | H.264 and HEVC only - a silicon limit |
 

@@ -1,0 +1,291 @@
+diff --git a/meson.build b/meson.build
+index 672da4a..496b6d6 100644
+--- a/meson.build
++++ b/meson.build
+@@ -56,7 +56,7 @@ sources = files(
+   'src/hevc.cpp',
+   'src/msm.c',
+   'src/surface-copy.cpp',
+-  'src/vp9.cpp',
++  'src/vp9.cpp', 'src/av1.cpp',
+   'src/vpp.cpp',
+ )
+ headers = files('src/internal.hpp')
+diff --git a/src/backend.cpp b/src/backend.cpp
+index 0dec510..ca5e77b 100644
+--- a/src/backend.cpp
++++ b/src/backend.cpp
+@@ -1,4 +1,5 @@
+ // SPDX-License-Identifier: MIT
++#include <cstddef>
+ #include "internal.hpp"
+ #include <drm_fourcc.h>
+ #include <linux/dma-buf.h>
+@@ -87,7 +88,7 @@ template <class F> VAStatus guard(VADriverContextP ctx, F f) noexcept {
+     }
+ static bool supported(VAProfile p) {
+     return p == VAProfileH264ConstrainedBaseline || p == VAProfileH264Main ||
+-           p == VAProfileH264High || is_hevc(p) || is_vp9(p);
++           p == VAProfileH264High || is_hevc(p) || is_vp9(p) || is_av1(p);
+ }
+ static bool encode_supported(const Driver &d, VAProfile p, VAEntrypoint e) {
+     return !d.encoder_device.empty() && e == VAEntrypointEncSlice &&
+@@ -263,7 +264,8 @@ API(query_profiles, (VADriverContextP ctx, VAProfile *out, int *count), (void)d;
+     check(out && count, "null profiles", VA_STATUS_ERROR_INVALID_PARAMETER);
+     out[0] = VAProfileH264ConstrainedBaseline; out[1] = VAProfileH264Main;
+     out[2] = VAProfileH264High; out[3] = VAProfileHEVCMain; out[4] = VAProfileHEVCMain10;
+-    out[5] = VAProfileVP9Profile0; out[6] = VAProfileVP9Profile2; *count = 7;
++    out[5] = VAProfileVP9Profile0; out[6] = VAProfileVP9Profile2;
++    out[7] = VAProfileAV1Profile0; out[8] = VAProfileAV1Profile1; *count = 9;
+     if (vpp_supported(VAProfileNone, VAEntrypointVideoProc)) out[(*count)++] = VAProfileNone;
+     return VA_STATUS_SUCCESS;)
+ API(query_entrypoints, (VADriverContextP ctx, VAProfile profile, VAEntrypoint *out, int *count),
+@@ -620,9 +622,12 @@ API(
+         return VA_STATUS_SUCCESS;
+     } if (!s->persistent_export) s->memory.reset();
+     s->status = VA_STATUS_SUCCESS; s->decoder = c->decoder; c->target = s; c->picture = Picture{};
+-    c->hevc_picture = HevcPicture{}; c->vp9_picture = Vp9Picture{}; return VA_STATUS_SUCCESS;)
++    c->hevc_picture = HevcPicture{}; c->vp9_picture = Vp9Picture{};
++    c->av1_picture = Av1Picture{}; return VA_STATUS_SUCCESS;)
+ template <class P> static void render_buffer(P &p, const std::shared_ptr<Buffer> &b) {
+     using Parameter = typename std::decay_t<decltype(p.pending_slices)>::value_type;
++    trace("render_buffer trace: type=%#x elements=%u size=%u", b->type, b->elements,
++          b->element_size); // render_buffer trace
+     using SliceType = typename std::decay_t<decltype(p.slices)>::value_type;
+     if (b->type == VAPictureParameterBufferType) {
+         check(b->element_size >= sizeof(p.params) && b->elements == 1, "invalid picture parameters",
+@@ -630,8 +635,9 @@ template <class P> static void render_buffer(P &p, const std::shared_ptr<Buffer>
+         std::memcpy(&p.params, b->data.data(), sizeof(p.params));
+         p.has_params = true;
+     } else if (b->type == VAIQMatrixBufferType) {
+-        if constexpr (std::is_same_v<P, Vp9Picture>) {
+-            throw Error(VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE, "VP9 has no IQ matrix buffer");
++        if constexpr (std::is_same_v<P, Vp9Picture> || std::is_same_v<P, Av1Picture>) {
++            throw Error(VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE,
++                        "this codec has no IQ matrix buffer");
+         } else {
+             check(b->element_size >= sizeof(p.iq) && b->elements == 1, "invalid IQ matrix",
+                   VA_STATUS_ERROR_INVALID_BUFFER);
+@@ -639,26 +645,41 @@ template <class P> static void render_buffer(P &p, const std::shared_ptr<Buffer>
+             p.has_iq = true;
+         }
+     } else if (b->type == VASliceParameterBufferType) {
+-        check(b->element_size >= sizeof(Parameter), "invalid slice parameters",
++        // Applications compile against their own copy of libva, so their slice
++        // parameter struct can be SMALLER than ours when libva has since grown
++        // fields. Copy the leading bytes and leave the rest zero: the fields this
++        // backend reads are the first ones in every codec's layout.
++        constexpr size_t needed = offsetof(Parameter, slice_data_flag) + sizeof(uint32_t);
++        check(b->element_size >= needed, "slice parameters too small for the slice fields",
+               VA_STATUS_ERROR_INVALID_BUFFER);
+         for (unsigned j = 0; j < b->elements; ++j) {
+-            Parameter s;
+-            std::memcpy(&s, b->data.data() + size_t(j) * b->element_size, sizeof(s));
++            Parameter s{};
++            const size_t n = std::min<size_t>(std::min<size_t>(b->element_size, sizeof(s)),
++                                              b->data.size() - size_t(j) * b->element_size);
++            std::memcpy(&s, b->data.data() + size_t(j) * b->element_size, n);
+             p.pending_slices.push_back(s);
+         }
+     } else if (b->type == VASliceDataBufferType) {
++        if constexpr (std::is_same_v<P, Av1Picture>) // AV1 debug
++            fprintf(stderr, "iris-vaapi: AV1 debug slice-data: %u elements, %u bytes each,"
++                            " pending=%zu\n",
++                    b->elements, b->element_size, p.pending_slices.size());
+         check(!p.pending_slices.empty(), "slice data missing parameters",
+               VA_STATUS_ERROR_INVALID_BUFFER);
+         for (const auto &s : p.pending_slices) {
+             check(s.slice_data_flag == VA_SLICE_DATA_FLAG_ALL, "fragmented slice not implemented",
+                   VA_STATUS_ERROR_UNIMPLEMENTED);
+             size_t off = s.slice_data_offset, n = s.slice_data_size;
++            if constexpr (std::is_same_v<P, Av1Picture>) // AV1 debug fields
++                fprintf(stderr, "iris-vaapi: AV1 debug slice: flag=%#x off=%zu n=%zu "
++                                "bufsize=%zu\n", s.slice_data_flag, off, n, b->data.size());
+             check(off <= b->data.size() && n <= b->data.size() - off, "slice data range",
+                   VA_STATUS_ERROR_INVALID_BUFFER);
+             SliceType slice;
+             slice.params = s;
+             slice.bytes.assign(b->data.begin() + off, b->data.begin() + off + n);
+-            if (!std::is_same_v<P, Vp9Picture> && slice.bytes.size() >= 4 && !slice.bytes[0] &&
++            if (!std::is_same_v<P, Vp9Picture> && !std::is_same_v<P, Av1Picture> &&
++                slice.bytes.size() >= 4 && !slice.bytes[0] &&
+                 !slice.bytes[1]) {
+                 unsigned prefix = slice.bytes[2] == 1                      ? 3
+                                   : !slice.bytes[2] && slice.bytes[3] == 1 ? 4
+@@ -689,7 +710,9 @@ API(
+             check(b->context_id == id, "encode buffer belongs to another context",
+                   VA_STATUS_ERROR_INVALID_BUFFER);
+             render_encode_buffer(c->encode_settings, c->encode_picture, *b);
+-        } else if (is_vp9(c->profile))
++        } else if (is_av1(c->profile))
++            render_buffer(c->av1_picture, b);
++        else if (is_vp9(c->profile))
+             render_buffer(c->vp9_picture, b);
+         else if (is_hevc(c->profile))
+             render_buffer(c->hevc_picture, b);
+@@ -741,7 +764,10 @@ API(
+     } try {
+         // Do not cache parameter sets from a rejected picture: the firmware
+         // has not received them. Commit only after successful submission.
+-        if (is_vp9(c->profile)) {
++        if (is_av1(c->profile)) {
++            auto bytes = av1_bitstream(c->profile, c->av1_picture);
++            c->decoder->submit(bytes, target);
++        } else if (is_vp9(c->profile)) {
+             auto bytes = vp9_bitstream(c->profile, c->vp9_picture);
+             c->decoder->submit(bytes, target);
+         } else if (is_hevc(c->profile)) {
+diff --git a/src/decoder.cpp b/src/decoder.cpp
+index 573a693..a0c92c0 100644
+--- a/src/decoder.cpp
++++ b/src/decoder.cpp
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: MIT
+ #include "internal.hpp"
++#include "av1-compat.hpp"
+ #include <linux/videodev2.h>
+ #include <sys/ioctl.h>
+ #include <sys/mman.h>
+@@ -79,7 +80,7 @@ std::string find_device() {
+                 v4l2_fmtdesc fmt{};
+                 fmt.type = OUTPUT;
+                 while (!call(fd, VIDIOC_ENUM_FMT, &fmt)) {
+-                    if (fmt.pixelformat == V4L2_PIX_FMT_H264)
++                    if (fmt.pixelformat == V4L2_PIX_FMT_H264 || fmt.pixelformat == V4L2_PIX_FMT_AV1)
+                         match = true;
+                     ++fmt.index;
+                 }
+@@ -105,7 +106,8 @@ Decoder::Decoder(const std::string &device, unsigned width, unsigned height, uns
+         fmt.type = OUTPUT;
+         fmt.fmt.pix_mp.width = width;
+         fmt.fmt.pix_mp.height = height;
+-        fmt.fmt.pix_mp.pixelformat = is_vp9(profile)    ? V4L2_PIX_FMT_VP9
++        fmt.fmt.pix_mp.pixelformat = is_av1(profile)   ? V4L2_PIX_FMT_AV1
++                                     : is_vp9(profile)  ? V4L2_PIX_FMT_VP9
+                                      : is_hevc(profile) ? V4L2_PIX_FMT_HEVC
+                                                         : V4L2_PIX_FMT_H264;
+         unsigned codec = fmt.fmt.pix_mp.pixelformat;
+diff --git a/src/internal.hpp b/src/internal.hpp
+index f1f44f3..c845ef1 100644
+--- a/src/internal.hpp
++++ b/src/internal.hpp
+@@ -6,6 +6,7 @@
+ #include <va/va_drmcommon.h>
+ #include <va/va_dec_hevc.h>
+ #include <va/va_dec_vp9.h>
++#include <va/va_dec_av1.h>
+ #include <va/va_enc_h264.h>
+ #include <va/va_enc_hevc.h>
+ #include <algorithm>
+@@ -141,11 +142,17 @@ struct HevcState {
+ inline bool is_hevc(VAProfile p) {
+     return p == VAProfileHEVCMain || p == VAProfileHEVCMain10;
+ }
++inline bool is_av1(VAProfile p) {
++    return p == VAProfileAV1Profile0 || p == VAProfileAV1Profile1;
++}
++
+ inline bool is_vp9(VAProfile p) {
+     return p == VAProfileVP9Profile0 || p == VAProfileVP9Profile2;
+ }
+ inline bool is_10bit(VAProfile p) {
+-    return p == VAProfileHEVCMain10 || p == VAProfileVP9Profile2;
++    // AV1 Profile 1 is 10-bit 4:2:0, like HEVC Main10 and VP9 Profile 2
++    return p == VAProfileAV1Profile1 ||
++           p == VAProfileHEVCMain10 || p == VAProfileVP9Profile2;
+ }
+ struct Vp9Slice {
+     VASliceParameterBufferVP9 params{};
+@@ -157,6 +164,21 @@ struct Vp9Picture {
+     std::vector<VASliceParameterBufferVP9> pending_slices;
+     std::vector<Vp9Slice> slices;
+ };
++struct Av1Slice {
++    VASliceParameterBufferAV1 params{};
++    std::vector<uint8_t> bytes;
++};
++struct Av1Picture {
++    VADecPictureParameterBufferAV1 params{};
++    // VA delivers the AV1 sequence header in its own buffer type; a stateful
++    // V4L2 decoder needs it in front of the frame, so keep it here.
++    std::vector<uint8_t> sequence;
++    bool has_params = false;
++    std::vector<VASliceParameterBufferAV1> pending_slices;
++    std::vector<Av1Slice> slices;
++};
++std::vector<uint8_t> av1_bitstream(VAProfile profile, const Av1Picture &picture);
++
+ std::vector<uint8_t> vp9_bitstream(VAProfile profile, const Vp9Picture &picture);
+ std::vector<uint8_t> h264_bitstream(VAProfile profile, const Picture &picture, H264State &state);
+ std::vector<uint8_t> hevc_bitstream(VAProfile profile, const HevcPicture &picture,
+@@ -260,6 +282,7 @@ struct Context {
+     HevcPicture hevc_picture;
+     HevcState hevc;
+     Vp9Picture vp9_picture;
++    Av1Picture av1_picture;
+ };
+ struct Config {
+     VAProfile profile;
+diff --git a/src/av1-compat.hpp b/src/av1-compat.hpp
+new file mode 100644
+index 0000000..a6368e4
+--- /dev/null
++++ b/src/av1-compat.hpp
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier: MIT
++//
++// The installed linux/videodev2.h predates the AV1 pixel format rename: it only defines
++// V4L2_PIX_FMT_AV1_FRAME ('AV1F'). The running kernel's iris driver enumerates
++// V4L2_PIX_FMT_AV1 ('AV01'), the compressed OBU stream this decoder consumes, so define
++// it here rather than depending on a newer libc headers package.
++#pragma once
++#include <linux/videodev2.h>
++#ifndef V4L2_PIX_FMT_AV1
++#define V4L2_PIX_FMT_AV1 v4l2_fourcc('A', 'V', '0', '1') /* AV1 OBU stream */
++#endif
+diff --git a/src/av1.cpp b/src/av1.cpp
+new file mode 100644
+index 0000000..2cf149d
+--- /dev/null
++++ b/src/av1.cpp
+@@ -0,0 +1,40 @@
++// SPDX-License-Identifier: MIT
++//
++// AV1 decoding for the Iris V4L2 stateful backend.
++//
++// The kernel driver exposes V4L2_PIX_FMT_AV1 ('AV01'), a compressed OBU stream, and its HFI
++// layer already implements AV1 profiles, levels, tiers, film grain and superblocks (see
++// iris_hfi_gen2_command.c). A stateful V4L2 decoder wants the temporal unit exactly as the
++// bitstream carries it.
++//
++// Unlike H.264/HEVC/VP9, VA does not deliver a picture parameter buffer for AV1: the frame
++// header and sequence header ride inside the slice data, so this is a straight passthrough
++// of the slice payload. Nothing is rewritten or stripped - AV1 uses OBU headers, not
++// Annex-B start codes.
++#include "internal.hpp"
++#include "av1-compat.hpp"
++
++namespace irisva {
++std::vector<uint8_t> av1_bitstream(VAProfile profile, const Av1Picture &picture) {
++    check(is_av1(profile), "AV1 requires an AV1 profile", VA_STATUS_ERROR_UNSUPPORTED_PROFILE);
++
++    std::vector<uint8_t> out;
++    size_t total = 0;
++    for (const auto &s : picture.slices)
++        total += s.bytes.size();
++    out.reserve(total + 16);
++
++    for (const auto &s : picture.slices) {
++        if (s.bytes.empty())
++            continue;
++        trace("AV1 slice %zu bytes (offset %u size %u flag %#x)", s.bytes.size(),
++              s.params.slice_data_offset, s.params.slice_data_size, s.params.slice_data_flag);
++        out.insert(out.end(), s.bytes.begin(), s.bytes.end());
++    }
++
++    check(!out.empty(), "AV1 produced no bitstream data", VA_STATUS_ERROR_INVALID_BUFFER);
++    trace("AV1 temporal unit: profile=%s bytes=%zu", profile == VAProfileAV1Profile1 ? "1" : "0",
++          out.size());
++    return out;
++}
++} // namespace irisva
